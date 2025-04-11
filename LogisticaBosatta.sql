@@ -206,9 +206,12 @@ CREATE TABLE Detalles_Venta (
     subtotal DECIMAL(12,2) NOT NULL,
     impuesto DECIMAL(12,2) NOT NULL,
     total DECIMAL(12,2) NOT NULL,
+    almacen_destino_id INT,  -- NUEVA COLUMNA
     FOREIGN KEY (venta_id) REFERENCES Ventas(venta_id),
-    FOREIGN KEY (producto_id) REFERENCES Productos(producto_id)
+    FOREIGN KEY (producto_id) REFERENCES Productos(producto_id),
+    FOREIGN KEY (almacen_destino_id) REFERENCES Almacenes(almacen_id) -- RELACIÓN CON ALMACENES
 );
+
 
 -- Tabla: Compras
 CREATE TABLE Compras (
@@ -905,25 +908,27 @@ BEGIN
         );
     END IF;
 END //
-DELIMITER ; -- 1. Función para calcular tiempos estimados de entrega
+-- ========================================
+-- FUNCIONES DE LOGÍSTICA Y ENVÍO
+-- ========================================
+
+-- 1. Función: Calcular Tiempo de Entrega
 DELIMITER //
 CREATE FUNCTION CalcularTiempoEntrega(
     p_ruta_id INT,
     p_numero_paradas INT
 ) RETURNS INT
 DETERMINISTIC
+READS SQL DATA
 BEGIN
     DECLARE v_tiempo_base INT;
-    DECLARE v_tiempo_por_parada INT;
+    DECLARE v_tiempo_por_parada INT DEFAULT 15;
     DECLARE v_tiempo_total INT;
     
     -- Obtener tiempo base de la ruta
     SELECT tiempo_estimado INTO v_tiempo_base
     FROM Rutas
     WHERE ruta_id = p_ruta_id;
-    
-    -- Establecer tiempo adicional por parada (15 minutos por parada)
-    SET v_tiempo_por_parada = 15;
     
     -- Calcular tiempo total
     SET v_tiempo_total = v_tiempo_base + (p_numero_paradas * v_tiempo_por_parada);
@@ -932,7 +937,7 @@ BEGIN
 END //
 DELIMITER ;
 
--- 2. Función para calcular costos de envío
+-- 2. Función: Calcular Costo de Envío
 DELIMITER //
 CREATE FUNCTION CalcularCostoEnvio(
     p_distancia DECIMAL(10,2),
@@ -948,27 +953,27 @@ BEGIN
     DECLARE v_costo_volumen DECIMAL(10,2);
     DECLARE v_costo_total DECIMAL(12,2);
     
-    -- Costo por distancia (0.15 por km)
+    -- Costo por distancia
     SET v_costo_distancia = p_distancia * 0.15;
     
-    -- Costo por peso (0.10 por kg después de los primeros 5kg)
+    -- Costo por peso
     IF p_peso > 5 THEN
         SET v_costo_peso = (p_peso - 5) * 0.10;
     ELSE
         SET v_costo_peso = 0;
     END IF;
     
-    -- Costo por volumen (0.05 por m³ después de los primeros 0.5m³)
+    -- Costo por volumen
     IF p_volumen > 0.5 THEN
         SET v_costo_volumen = (p_volumen - 0.5) * 0.05;
     ELSE
         SET v_costo_volumen = 0;
     END IF;
     
-    -- Costo total
+    -- Sumar todos los costos
     SET v_costo_total = v_costo_base + v_costo_distancia + v_costo_peso + v_costo_volumen;
     
-    -- Recargo por envío urgente (50%)
+    -- Recargo por urgente
     IF p_urgente THEN
         SET v_costo_total = v_costo_total * 1.5;
     END IF;
@@ -977,7 +982,7 @@ BEGIN
 END //
 DELIMITER ;
 
--- 3. Función para determinar la ruta más eficiente
+-- 3. Función: Determinar Ruta Más Eficiente
 DELIMITER //
 CREATE FUNCTION DeterminarRutaMasEficiente(
     p_almacen_id INT,
@@ -985,30 +990,31 @@ CREATE FUNCTION DeterminarRutaMasEficiente(
     p_destino_codigo_postal VARCHAR(20)
 ) RETURNS INT
 NOT DETERMINISTIC
+READS SQL DATA
 BEGIN
     DECLARE v_ruta_id INT;
     DECLARE v_coincidencia_exacta INT;
     
-    -- Primero buscar rutas que coincidan exactamente con el código postal
+    -- Buscar coincidencia exacta por código postal
     SELECT r.ruta_id INTO v_coincidencia_exacta
     FROM Rutas r
     JOIN Puntos_Ruta pr ON r.ruta_id = pr.ruta_id
     WHERE r.origen_id = p_almacen_id
-    AND pr.codigo_postal = p_destino_codigo_postal
-    AND pr.tipo_punto = 'destino'
+      AND pr.codigo_postal = p_destino_codigo_postal
+      AND pr.tipo_punto = 'destino'
     LIMIT 1;
     
     IF v_coincidencia_exacta IS NOT NULL THEN
         RETURN v_coincidencia_exacta;
     END IF;
     
-    -- Si no hay coincidencia exacta, buscar por ciudad
+    -- Buscar por ciudad si no hay coincidencia exacta
     SELECT r.ruta_id INTO v_ruta_id
     FROM Rutas r
     JOIN Puntos_Ruta pr ON r.ruta_id = pr.ruta_id
     WHERE r.origen_id = p_almacen_id
-    AND pr.ciudad = p_destino_ciudad
-    AND pr.tipo_punto = 'destino'
+      AND pr.ciudad = p_destino_ciudad
+      AND pr.tipo_punto = 'destino'
     ORDER BY (
         SELECT AVG(rl.eficiencia_carga)
         FROM Rendimiento_Logistico rl
@@ -1020,7 +1026,7 @@ BEGIN
 END //
 DELIMITER ;
 
--- 4. Función para calcular descuentos por volumen
+-- 4. Función: Calcular Descuento por Volumen
 DELIMITER //
 CREATE FUNCTION CalcularDescuentoVolumen(
     p_cliente_id INT,
@@ -1028,6 +1034,7 @@ CREATE FUNCTION CalcularDescuentoVolumen(
     p_cantidad_items INT
 ) RETURNS DECIMAL(12,2)
 DETERMINISTIC
+READS SQL DATA
 BEGIN
     DECLARE v_descuento DECIMAL(5,2) DEFAULT 0;
     DECLARE v_tipo_cliente VARCHAR(50);
@@ -1038,33 +1045,33 @@ BEGIN
     FROM Clientes
     WHERE cliente_id = p_cliente_id;
     
-    -- Obtener número de compras previas en los últimos 6 meses
+    -- Compras previas en los últimos 6 meses
     SELECT COUNT(*) INTO v_compras_previas
     FROM Ventas
     WHERE cliente_id = p_cliente_id
-    AND fecha_venta >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH);
+      AND fecha_venta >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH);
     
-    -- Aplicar descuentos basados en diferentes criterios
+    -- Reglas de descuento
     IF v_tipo_cliente = 'corporativo' THEN
-        SET v_descuento = LEAST(20, v_descuento + 5); -- 5% adicional para corporativos
+        SET v_descuento = LEAST(20, v_descuento + 5);
     END IF;
     
     IF p_total_compra > 1000 THEN
-        SET v_descuento = LEAST(20, v_descuento + 5); -- 5% adicional para compras >1000
+        SET v_descuento = LEAST(20, v_descuento + 5);
     END IF;
     
     IF p_cantidad_items > 10 THEN
-        SET v_descuento = LEAST(20, v_descuento + 3); -- 3% adicional para >10 items
+        SET v_descuento = LEAST(20, v_descuento + 3);
     END IF;
     
     IF v_compras_previas > 5 THEN
-        SET v_descuento = LEAST(20, v_descuento + 2); -- 2% adicional para clientes frecuentes
+        SET v_descuento = LEAST(20, v_descuento + 2);
     END IF;
     
-    -- Calcular monto de descuento
     RETURN ROUND(p_total_compra * v_descuento / 100, 2);
 END //
 DELIMITER ;
+
 
 -- 1. Eficiencia logística
 SELECT 
